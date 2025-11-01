@@ -229,3 +229,6 @@ charset-normalizer==3.4.3
 idna==3.10
 six==1.16.0
 wrapt==1.17.3
+
+# Local Storage Persistence
+streamlit-local-storage==0.0.25

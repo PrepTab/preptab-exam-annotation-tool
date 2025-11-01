@@ -11,6 +11,9 @@ from question import Question
 from database import AsyncSessionLocal, get_db
 from sqlalchemy import select, text
 
+# Import localStorage functionality
+from streamlit_local_storage import LocalStorage
+
 # Page configuration
 st.set_page_config(
     page_title="Exam Annotation Tool",
@@ -18,6 +21,36 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Initialize LocalStorage
+if 'localS' not in st.session_state:
+    st.session_state.localS = LocalStorage()
+
+# LocalStorage keys
+EXAM_DATA_KEY = "preptab_exam_data"
+QUESTIONS_KEY = "preptab_questions"
+
+# Available subjects
+SUBJECTS = [
+    "Mathematics",
+    "English",
+    "Physics",
+    "Chemistry",
+    "Biology",
+    "Government",
+    "Computer Science",
+    "Agricultural Science",
+    "History",
+    "Animal Husbandry",
+    "Data Processing",
+    "Economics",
+    "Civic Education",
+    "Geography",
+    "Literature in English"
+]
+
+# Available years (2015 to 2025)
+EXAM_YEARS = list(range(2015, 2026))  # 2015 to 2025 inclusive
 
 # Custom CSS for better styling
 st.markdown("""
@@ -61,15 +94,119 @@ st.markdown("""
         border-radius: 4px;
         margin: 1rem 0;
     }
+    .auto-save-indicator {
+        font-size: 0.85rem;
+        color: #6c757d;
+        font-style: italic;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
+# Helper functions for localStorage
+def datetime_encoder(obj):
+    """Custom JSON encoder for datetime objects"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+def generate_exam_title():
+    """Generate exam title from exam_type, subject, and year"""
+    exam_type = st.session_state.exam_data.get('exam_type', '')
+    subject = st.session_state.exam_data.get('subject', '')
+    year = st.session_state.exam_data.get('year', '')
+    
+    if exam_type and subject and year:
+        return f"{exam_type} {subject} {year}"
+    return ""
+
+def update_exam_title():
+    """Update exam title when exam details change"""
+    st.session_state.exam_data['title'] = generate_exam_title()
+
+def save_exam_to_storage():
+    """Save exam data and questions to localStorage"""
+    try:
+        # Update title before saving
+        update_exam_title()
+        
+        # Set flag to trigger save on next render
+        st.session_state.auto_saved = True
+        st.session_state.needs_save = True
+        
+        # Store last save time for debugging
+        st.session_state.last_save_time = datetime.now().isoformat()
+        
+    except Exception as e:
+        # Log error but don't break the app
+        st.session_state.storage_error = str(e)
+        pass
+
+def load_exam_from_storage():
+    """Load exam data and questions from localStorage"""
+    try:
+        # Use unique keys for each getItem call
+        # The library stores results in session_state with the key parameter
+        exam_data_key = f"load_{EXAM_DATA_KEY}"
+        questions_key = f"load_{QUESTIONS_KEY}"
+        
+        # Call getItem - the value will be stored in session_state after component renders
+        # Based on library docs, getItem(itemKey, key="session_state_key")
+        # But if key parameter doesn't work, we'll use a different approach
+        exam_data_result = st.session_state.localS.getItem(EXAM_DATA_KEY)
+        questions_result = st.session_state.localS.getItem(QUESTIONS_KEY)
+        
+        # Check if we got results directly or need to check session_state
+        exam_data_loaded = False
+        questions_loaded = False
+        
+        # Try direct result first
+        if exam_data_result:
+            try:
+                if isinstance(exam_data_result, str) and exam_data_result.strip() and exam_data_result != "null":
+                    exam_data = json.loads(exam_data_result)
+                    st.session_state.exam_data = exam_data
+                    exam_data_loaded = True
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+        
+        if questions_result:
+            try:
+                if isinstance(questions_result, str) and questions_result.strip() and questions_result != "null":
+                    questions = json.loads(questions_result)
+                    st.session_state.questions = questions
+                    questions_loaded = True
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+        
+        return exam_data_loaded or questions_loaded
+    except Exception as e:
+        # Silently fail if localStorage is unavailable or data is invalid
+        pass
+    return False
+
+def clear_exam_storage():
+    """Clear exam-related data from localStorage"""
+    try:
+        # Use unique keys to ensure the clear components render
+        if 'clear_counter' not in st.session_state:
+            st.session_state.clear_counter = 0
+        st.session_state.clear_counter += 1
+        
+        # Clear by setting empty strings - these need to render to work
+        st.session_state.localS.setItem(EXAM_DATA_KEY, "", key=f"clear_exam_{st.session_state.clear_counter}")
+        st.session_state.localS.setItem(QUESTIONS_KEY, "", key=f"clear_questions_{st.session_state.clear_counter}")
+    except Exception as e:
+        # Silently fail if localStorage is unavailable
+        pass
+
+# Initialize session state - set defaults first
 if 'exam_data' not in st.session_state:
+    # Default year to 2025 (most recent in range) or current year if in range
+    default_year = min(datetime.now().year, max(EXAM_YEARS)) if datetime.now().year <= max(EXAM_YEARS) else max(EXAM_YEARS)
     st.session_state.exam_data = {
         'exam_type': None,
         'subject': '',
-        'year': datetime.now().year,
+        'year': default_year,
         'title': '',
         'duration': 60
     }
@@ -158,115 +295,210 @@ async def save_exam_to_database(exam_data: Dict, questions: List[Dict]) -> Optio
 
 # Main interface
 def main():
+    # Initialize localStorage components (they need to render to work)
+    # Call getItem to load data from localStorage - it returns the value directly
+    if 'localstorage_initialized' not in st.session_state:
+        # Try to load data from localStorage
+        try:
+            exam_data_result = st.session_state.localS.getItem(EXAM_DATA_KEY)
+            questions_result = st.session_state.localS.getItem(QUESTIONS_KEY)
+            
+            # Process exam_data
+            if exam_data_result and isinstance(exam_data_result, str) and exam_data_result.strip() and exam_data_result != "null":
+                try:
+                    exam_data = json.loads(exam_data_result)
+                    if exam_data and exam_data != st.session_state.get('exam_data'):
+                        st.session_state.exam_data = exam_data
+                        if 'data_restored_shown' not in st.session_state:
+                            st.session_state.data_restored_shown = True
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            
+            # Process questions
+            if questions_result and isinstance(questions_result, str) and questions_result.strip() and questions_result != "null":
+                try:
+                    questions = json.loads(questions_result)
+                    if questions and questions != st.session_state.get('questions'):
+                        st.session_state.questions = questions
+                        if 'data_restored_shown' not in st.session_state:
+                            st.session_state.data_restored_shown = True
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            
+            st.session_state.localstorage_initialized = True
+        except Exception as e:
+            # Silently fail if localStorage is unavailable
+            st.session_state.localstorage_initialized = True
+            pass
+    
+    # Show restoration message if data was loaded from localStorage
+    if st.session_state.get('data_restored_shown', False) and not st.session_state.get('restore_message_shown', False):
+        st.info("📥 Restored exam data from browser storage. You can continue where you left off!")
+        st.session_state.restore_message_shown = True
+        st.session_state.data_restored_shown = False  # Reset flag
+    
     st.markdown('<h1 class="main-header">📝 Exam Annotation Tool</h1>', unsafe_allow_html=True)
     
-    # Sidebar for navigation
-    st.sidebar.title("Navigation")
-    page = st.sidebar.radio("Select Page", ["Create Exam", "View Questions", "Database Status"])
+    # Setup navigation using st.navigation
+    pages = [
+        st.Page(create_exam_page, title="Create Exam"),
+        st.Page(view_questions_page, title="View Questions"),
+        st.Page(database_status_page, title="Database Status")
+    ]
     
-    if page == "Create Exam":
-        create_exam_page()
-    elif page == "View Questions":
-        view_questions_page()
-    elif page == "Database Status":
-        database_status_page()
+    pg = st.navigation(pages, position="sidebar")
+    pg.run()
 
 def create_exam_page():
-    st.markdown('<h2 class="section-header">📋 Exam Details</h2>', unsafe_allow_html=True)
+    # Save to localStorage at the start if needed (before any UI that might cause rerun)
+    if st.session_state.get('needs_save', False):
+        try:
+            update_exam_title()
+            exam_data_json = json.dumps(st.session_state.exam_data, default=datetime_encoder)
+            questions_json = json.dumps(st.session_state.questions, default=datetime_encoder)
+            
+            if 'save_counter' not in st.session_state:
+                st.session_state.save_counter = 0
+            st.session_state.save_counter += 1
+            
+            st.session_state.localS.setItem(
+                EXAM_DATA_KEY, 
+                exam_data_json, 
+                key=f"save_exam_{st.session_state.save_counter}"
+            )
+            st.session_state.localS.setItem(
+                QUESTIONS_KEY, 
+                questions_json, 
+                key=f"save_questions_{st.session_state.save_counter}"
+            )
+            st.session_state.needs_save = False
+        except Exception:
+            pass
+    
+    st.markdown('<h2 class="section-header">Exam Details</h2>', unsafe_allow_html=True)
     
     # Exam details form
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
+        # Get current exam_type index
+        exam_type_options = [e.value for e in ExamType]
+        current_exam_type = st.session_state.exam_data.get('exam_type')
+        exam_type_index = exam_type_options.index(current_exam_type) if current_exam_type in exam_type_options else 0
+        
         exam_type = st.selectbox(
             "Exam Type",
-            options=[e.value for e in ExamType],
-            index=0,
-            help="Select the type of exam you're creating"
+            options=exam_type_options,
+            index=exam_type_index,
+            help="Select the type of exam you're creating",
+            on_change=save_exam_to_storage
         )
         st.session_state.exam_data['exam_type'] = exam_type
+    
+    with col2:
+        # Get current subject index
+        current_subject = st.session_state.exam_data.get('subject', '')
+        subject_index = SUBJECTS.index(current_subject) if current_subject in SUBJECTS else 0
         
-        subject = st.text_input(
+        subject = st.selectbox(
             "Subject",
-            value=st.session_state.exam_data['subject'],
-            placeholder="e.g., Mathematics, Physics, Chemistry",
-            help="Enter the subject for this exam"
+            options=SUBJECTS,
+            index=subject_index,
+            help="Select the subject for this exam",
+            on_change=save_exam_to_storage
         )
         st.session_state.exam_data['subject'] = subject
+    
+    with col3:
+        # Get current year index
+        default_year = min(datetime.now().year, max(EXAM_YEARS)) if datetime.now().year <= max(EXAM_YEARS) else max(EXAM_YEARS)
+        current_year = st.session_state.exam_data.get('year', default_year)
+        year_index = EXAM_YEARS.index(current_year) if current_year in EXAM_YEARS else len(EXAM_YEARS) - 1
         
-        year = st.number_input(
+        year = st.selectbox(
             "Year",
-            min_value=2000,
-            max_value=2030,
-            value=st.session_state.exam_data['year'],
-            help="Enter the year for this exam"
+            options=EXAM_YEARS,
+            index=year_index,
+            help="Select the year for this exam",
+            on_change=save_exam_to_storage
         )
         st.session_state.exam_data['year'] = year
     
-    with col2:
-        title = st.text_input(
-            "Exam Title",
-            value=st.session_state.exam_data['title'],
-            placeholder="e.g., WAEC Mathematics 2024",
-            help="Enter a descriptive title for this exam"
-        )
-        st.session_state.exam_data['title'] = title
-        
-        duration = st.number_input(
-            "Duration (minutes)",
-            min_value=15,
-            max_value=300,
-            value=st.session_state.exam_data['duration'],
-            help="Enter the duration in minutes"
-        )
-        st.session_state.exam_data['duration'] = duration
+    # Auto-generate and display title
+    exam_title = generate_exam_title()
+    st.session_state.exam_data['title'] = exam_title
     
-    st.markdown('<h2 class="section-header">❓ Add Questions</h2>', unsafe_allow_html=True)
+    if exam_title:
+        st.info(f"**Exam Title:** {exam_title}")
+    
+    # Duration
+    duration = st.number_input(
+        "Duration (minutes)",
+        min_value=15,
+        max_value=300,
+        value=st.session_state.exam_data.get('duration', 60),
+        help="Enter the duration in minutes",
+        on_change=save_exam_to_storage
+    )
+    st.session_state.exam_data['duration'] = duration
+    
+    # Auto-save indicator
+    if st.session_state.get('auto_saved', False):
+        st.markdown('<p class="auto-save-indicator">💾 Auto-saved to browser storage</p>', unsafe_allow_html=True)
+    
+    # Always render localStorage save components when data changes
+    # Streamlit components need to be in the render flow to work
+    if st.session_state.get('needs_save', False):
+        try:
+            exam_data_json = json.dumps(st.session_state.exam_data, default=datetime_encoder)
+            questions_json = json.dumps(st.session_state.questions, default=datetime_encoder)
+            
+            # Use a counter to ensure unique keys for each render (required for components)
+            if 'save_counter' not in st.session_state:
+                st.session_state.save_counter = 0
+            st.session_state.save_counter += 1
+            
+            # Render the localStorage components - they need to be in the UI flow
+            with st.container():
+                # These will render invisibly but will save to localStorage
+                st.session_state.localS.setItem(
+                    EXAM_DATA_KEY, 
+                    exam_data_json, 
+                    key=f"persist_exam_{st.session_state.save_counter}"
+                )
+                st.session_state.localS.setItem(
+                    QUESTIONS_KEY, 
+                    questions_json, 
+                    key=f"persist_questions_{st.session_state.save_counter}"
+                )
+            
+            # Reset the flag after rendering
+            st.session_state.needs_save = False
+        except Exception as e:
+            # Silently handle errors
+            st.session_state.needs_save = False
+            pass
+    
+    st.markdown('<h2 class="section-header">Add Question</h2>', unsafe_allow_html=True)
+    
+    # Show success message if question was just added
+    if st.session_state.get('question_added_success', False):
+        total_questions = len(st.session_state.questions)
+        st.success(f"✅ Question {total_questions} added successfully! Total questions: {total_questions}")
+        st.session_state.question_added_success = False  # Reset flag after showing
     
     # Question form
-    with st.form("question_form", clear_on_submit=False):
-        st.markdown("### Question Details")
+    with st.form("question_form", clear_on_submit=True):
         
-        # Question text in multiple languages
-        st.markdown("**Question Text (Multilingual)**")
-        col1, col2 = st.columns(2)
+        question_en = st.text_area(
+            "Question",
+            value=st.session_state.current_question['question']['en'],
+            placeholder="Enter the question",
+            height=100,
+            help="Enter the question text"
+        )
+        st.session_state.current_question['question']['en'] = question_en
         
-        with col1:
-            question_en = st.text_area(
-                "English",
-                value=st.session_state.current_question['question']['en'],
-                placeholder="Enter the question in English",
-                height=100
-            )
-            st.session_state.current_question['question']['en'] = question_en
-            
-            question_ha = st.text_area(
-                "Hausa",
-                value=st.session_state.current_question['question']['ha'],
-                placeholder="Enter the question in Hausa (optional)",
-                height=100
-            )
-            st.session_state.current_question['question']['ha'] = question_ha
-        
-        with col2:
-            question_ig = st.text_area(
-                "Igbo",
-                value=st.session_state.current_question['question']['ig'],
-                placeholder="Enter the question in Igbo (optional)",
-                height=100
-            )
-            st.session_state.current_question['question']['ig'] = question_ig
-            
-            question_yo = st.text_area(
-                "Yoruba",
-                value=st.session_state.current_question['question']['yo'],
-                placeholder="Enter the question in Yoruba (optional)",
-                height=100
-            )
-            st.session_state.current_question['question']['yo'] = question_yo
-        
-        # Options
-        st.markdown("**Answer Options**")
         col1, col2 = st.columns(2)
         
         with col1:
@@ -300,89 +532,28 @@ def create_exam_page():
             st.session_state.current_question['options']['D'] = option_d
         
         # Correct answer
-        correct_answer = st.selectbox(
-            "Correct Answer",
+        st.markdown("**Correct Answer**")
+        correct_answer = st.pills(
+            "Select the correct answer",
             options=['A', 'B', 'C', 'D'],
-            index=['A', 'B', 'C', 'D'].index(st.session_state.current_question['answer']),
-            help="Select the correct answer"
+            default=st.session_state.current_question['answer'],
+            selection_mode="single",
+            help="Select the correct answer",
+            label_visibility="collapsed"
         )
-        st.session_state.current_question['answer'] = correct_answer
+        if correct_answer:
+            st.session_state.current_question['answer'] = correct_answer
+        else:
+            st.session_state.current_question['answer'] = 'A'  # Default to 'A' if None
         
-        # Explanation in multiple languages
-        st.markdown("**Explanation (Multilingual)**")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            explanation_en = st.text_area(
-                "English Explanation",
-                value=st.session_state.current_question['explanation']['en'],
-                placeholder="Explain why this answer is correct in English",
-                height=80
-            )
-            st.session_state.current_question['explanation']['en'] = explanation_en
-            
-            explanation_ha = st.text_area(
-                "Hausa Explanation",
-                value=st.session_state.current_question['explanation']['ha'],
-                placeholder="Explain in Hausa (optional)",
-                height=80
-            )
-            st.session_state.current_question['explanation']['ha'] = explanation_ha
-        
-        with col2:
-            explanation_ig = st.text_area(
-                "Igbo Explanation",
-                value=st.session_state.current_question['explanation']['ig'],
-                placeholder="Explain in Igbo (optional)",
-                height=80
-            )
-            st.session_state.current_question['explanation']['ig'] = explanation_ig
-            
-            explanation_yo = st.text_area(
-                "Yoruba Explanation",
-                value=st.session_state.current_question['explanation']['yo'],
-                placeholder="Explain in Yoruba (optional)",
-                height=80
-            )
-            st.session_state.current_question['explanation']['yo'] = explanation_yo
-        
-        # Verbose content in multiple languages
-        st.markdown("**Verbose Content (Multilingual)**")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            verbose_en = st.text_area(
-                "English Verbose",
-                value=st.session_state.current_question['verbose']['en'],
-                placeholder="Additional detailed explanation in English (optional)",
-                height=80
-            )
-            st.session_state.current_question['verbose']['en'] = verbose_en
-            
-            verbose_ha = st.text_area(
-                "Hausa Verbose",
-                value=st.session_state.current_question['verbose']['ha'],
-                placeholder="Additional explanation in Hausa (optional)",
-                height=80
-            )
-            st.session_state.current_question['verbose']['ha'] = verbose_ha
-        
-        with col2:
-            verbose_ig = st.text_area(
-                "Igbo Verbose",
-                value=st.session_state.current_question['verbose']['ig'],
-                placeholder="Additional explanation in Igbo (optional)",
-                height=80
-            )
-            st.session_state.current_question['verbose']['ig'] = verbose_ig
-            
-            verbose_yo = st.text_area(
-                "Yoruba Verbose",
-                value=st.session_state.current_question['verbose']['yo'],
-                placeholder="Additional explanation in Yoruba (optional)",
-                height=80
-            )
-            st.session_state.current_question['verbose']['yo'] = verbose_yo
+        explanation_en = st.text_area(
+            "Explanation",
+            value=st.session_state.current_question['explanation']['en'],
+            placeholder="Explain why this answer is correct",
+            height=100,
+            help="Enter the explanation for the correct answer"
+        )
+        st.session_state.current_question['explanation']['en'] = explanation_en
         
         # Form buttons
         col1, col2, col3 = st.columns(3)
@@ -414,8 +585,9 @@ def create_exam_page():
                     'verbose': st.session_state.current_question['verbose'].copy()
                 }
                 st.session_state.questions.append(question_copy)
-                st.success(f"✅ Question {len(st.session_state.questions)} added successfully!")
+                save_exam_to_storage()  # Auto-save after adding question
                 reset_current_question()
+                st.session_state.question_added_success = True
                 st.rerun()
         
         if clear_form:
@@ -425,12 +597,16 @@ def create_exam_page():
         if save_exam:
             # Validate exam data
             if not st.session_state.exam_data['subject']:
-                st.error("Please enter a subject for the exam")
-            elif not st.session_state.exam_data['title']:
-                st.error("Please enter a title for the exam")
+                st.error("Please select a subject for the exam")
+            elif not st.session_state.exam_data['exam_type']:
+                st.error("Please select an exam type")
+            elif not st.session_state.exam_data['year']:
+                st.error("Please select a year for the exam")
             elif not st.session_state.questions:
                 st.error("Please add at least one question before saving")
             else:
+                # Ensure title is generated
+                update_exam_title()
                 # Save to database
                 with st.spinner("Saving exam to database..."):
                     exam_id = asyncio.run(save_exam_to_database(
@@ -440,22 +616,69 @@ def create_exam_page():
                 
                 if exam_id:
                     st.success(f"🎉 Exam saved successfully! Exam ID: {exam_id}")
-                    # Reset session state
+                    # Reset session state first
+                    default_year = min(datetime.now().year, max(EXAM_YEARS)) if datetime.now().year <= max(EXAM_YEARS) else max(EXAM_YEARS)
                     st.session_state.exam_data = {
                         'exam_type': None,
                         'subject': '',
-                        'year': datetime.now().year,
+                        'year': default_year,
                         'title': '',
                         'duration': 60
                     }
                     st.session_state.questions = []
                     reset_current_question()
+                    st.session_state.auto_saved = False
+                    # Mark that localStorage should be cleared
+                    st.session_state.should_clear_storage = True
                     st.rerun()
                 else:
                     st.error("❌ Failed to save exam to database")
+    
+    # Clear localStorage if exam was successfully saved to database
+    if st.session_state.get('should_clear_storage', False):
+        try:
+            # Use unique keys to ensure the clear components render
+            if 'clear_counter' not in st.session_state:
+                st.session_state.clear_counter = 0
+            st.session_state.clear_counter += 1
+            
+            # Render clear components - they need to be in UI flow to work
+            st.session_state.localS.setItem(EXAM_DATA_KEY, "", key=f"clear_exam_{st.session_state.clear_counter}")
+            st.session_state.localS.setItem(QUESTIONS_KEY, "", key=f"clear_questions_{st.session_state.clear_counter}")
+            st.session_state.should_clear_storage = False
+        except Exception:
+            st.session_state.should_clear_storage = False
+            pass
+    
+    # Always save to localStorage at the end of the page if we have questions
+    # This ensures data persists even if other saves didn't trigger
+    if 'questions' in st.session_state and len(st.session_state.questions) > 0:
+        try:
+            update_exam_title()
+            exam_data_json = json.dumps(st.session_state.exam_data, default=datetime_encoder)
+            questions_json = json.dumps(st.session_state.questions, default=datetime_encoder)
+            
+            # Use a stable key pattern that updates each render
+            if 'final_save_counter' not in st.session_state:
+                st.session_state.final_save_counter = 0
+            st.session_state.final_save_counter += 1
+            
+            # Render components at end to ensure they execute
+            st.session_state.localS.setItem(
+                EXAM_DATA_KEY, 
+                exam_data_json, 
+                key=f"final_save_exam_{st.session_state.final_save_counter}"
+            )
+            st.session_state.localS.setItem(
+                QUESTIONS_KEY, 
+                questions_json, 
+                key=f"final_save_questions_{st.session_state.final_save_counter}"
+            )
+        except Exception:
+            pass
 
 def view_questions_page():
-    st.markdown('<h2 class="section-header">📚 Current Questions</h2>', unsafe_allow_html=True)
+    st.markdown('<h2 class="section-header">Current Questions</h2>', unsafe_allow_html=True)
     
     if not st.session_state.questions:
         st.info("No questions added yet. Go to 'Create Exam' to add questions.")
@@ -484,6 +707,7 @@ def view_questions_page():
     with col1:
         if st.button("🗑️ Clear All Questions", type="secondary"):
             st.session_state.questions = []
+            save_exam_to_storage()  # Auto-save after clearing
             st.success("All questions cleared!")
             st.rerun()
     
@@ -492,6 +716,7 @@ def view_questions_page():
             if st.session_state.questions:
                 last_question = st.session_state.questions[-1].copy()
                 st.session_state.questions.append(last_question)
+                save_exam_to_storage()  # Auto-save after duplicating
                 st.success("Last question duplicated!")
                 st.rerun()
             else:
@@ -519,11 +744,13 @@ def view_questions_page():
                     # Move question up
                     if i > 0:
                         st.session_state.questions[i], st.session_state.questions[i-1] = st.session_state.questions[i-1], st.session_state.questions[i]
+                        save_exam_to_storage()  # Auto-save after reordering
                         st.rerun()
                 if st.button("⬇️", key=f"down_{i}", disabled=(i == len(st.session_state.questions)-1)):
                     # Move question down
                     if i < len(st.session_state.questions)-1:
                         st.session_state.questions[i], st.session_state.questions[i+1] = st.session_state.questions[i+1], st.session_state.questions[i]
+                        save_exam_to_storage()  # Auto-save after reordering
                         st.rerun()
         
         col1, col2 = st.columns(2)
@@ -551,24 +778,14 @@ def view_questions_page():
             with col2:
                 if st.button("🗑️", key=f"delete_{i}", help="Delete this question"):
                     st.session_state.questions.pop(i)
+                    save_exam_to_storage()  # Auto-save after deleting
                     st.success(f"Question {i+1} deleted!")
                     st.rerun()
             
             # Question details in expander
             with st.expander(f"View Details - Question {i+1}", expanded=False):
-                st.markdown("**Question Text:**")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.write(f"🇬🇧 English: {question['question']['en']}")
-                    if question['question']['ha']:
-                        st.write(f"🇳🇬 Hausa: {question['question']['ha']}")
-                
-                with col2:
-                    if question['question']['ig']:
-                        st.write(f"🇳🇬 Igbo: {question['question']['ig']}")
-                    if question['question']['yo']:
-                        st.write(f"🇳🇬 Yoruba: {question['question']['yo']}")
+                st.markdown("**Question:**")
+                st.write(question['question']['en'])
                 
                 st.markdown("**Options:**")
                 col1, col2 = st.columns(2)
@@ -584,19 +801,7 @@ def view_questions_page():
                         st.write(f"{marker} {option}: {question['options'][option]}")
                 
                 st.markdown("**Explanation:**")
-                st.write(f"🇬🇧 English: {question['explanation']['en']}")
-                
-                if any(question['explanation'][lang] for lang in ['ha', 'ig', 'yo']):
-                    st.markdown("**Other Languages:**")
-                    for lang, name in [('ha', 'Hausa'), ('ig', 'Igbo'), ('yo', 'Yoruba')]:
-                        if question['explanation'][lang]:
-                            st.write(f"🇳🇬 {name}: {question['explanation'][lang]}")
-                
-                if any(question['verbose'][lang] for lang in ['en', 'ha', 'ig', 'yo']):
-                    st.markdown("**Verbose Content:**")
-                    for lang, name in [('en', 'English'), ('ha', 'Hausa'), ('ig', 'Igbo'), ('yo', 'Yoruba')]:
-                        if question['verbose'][lang]:
-                            st.write(f"🇳🇬 {name}: {question['verbose'][lang]}")
+                st.write(question['explanation']['en'])
                 
                 # Edit question button
                 if st.button(f"✏️ Edit Question {i+1}", key=f"edit_{i}"):
@@ -610,11 +815,12 @@ def view_questions_page():
                     }
                     # Remove the question from the list
                     st.session_state.questions.pop(i)
+                    save_exam_to_storage()  # Auto-save after editing (removing from list)
                     st.success(f"Question {i+1} moved to edit form!")
                     st.rerun()
 
 def database_status_page():
-    st.markdown('<h2 class="section-header">🗄️ Database Status</h2>', unsafe_allow_html=True)
+    st.markdown('<h2 class="section-header">Database Status</h2>', unsafe_allow_html=True)
     
     # Test database connection
     with st.spinner("Testing database connection..."):
