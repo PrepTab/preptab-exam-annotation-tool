@@ -133,6 +133,7 @@ greenlet==3.2.4
 # Database
 sqlalchemy==2.0.43
 asyncpg==0.30.0
+psycopg2-binary==2.9.11
 
 # Environment and Configuration
 python-dotenv==1.0.1
@@ -232,3 +233,6 @@ wrapt==1.17.3
 
 # Local Storage Persistence
 streamlit-local-storage==0.0.25
+
+# Async support for Streamlit
+nest-asyncio==1.6.0

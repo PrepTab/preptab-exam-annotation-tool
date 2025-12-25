@@ -1,15 +1,43 @@
 import streamlit as st
-import asyncio
 import json
 from typing import Dict, List, Optional
 from datetime import datetime
 import uuid
+import os
+from dotenv import load_dotenv
 
 # Import from your existing modules
 from exam import Exam, ExamType
 from question import Question
-from database import AsyncSessionLocal, get_db
-from sqlalchemy import select, text
+from sqlalchemy import create_engine, select, text, func, delete
+from sqlalchemy.orm import sessionmaker, Session
+
+# Load environment variables
+load_dotenv()
+
+# Create SYNCHRONOUS database engine for Streamlit
+DATABASE_URL = os.getenv("DATABASE_URL") or st.secrets.get("DATABASE_URL")
+# Convert async URL to sync URL
+if DATABASE_URL and DATABASE_URL.startswith("postgresql+asyncpg://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql+psycopg2://")
+
+# Create sync engine
+sync_engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=5,
+    max_overflow=10,
+    pool_recycle=3600,
+    pool_pre_ping=True,
+)
+
+# Create sync session maker
+SyncSessionLocal = sessionmaker(
+    bind=sync_engine,
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False
+)
 
 # Import localStorage functionality
 from streamlit_local_storage import LocalStorage
@@ -223,6 +251,13 @@ if 'current_question' not in st.session_state:
         'verbose': {'en': '', 'ha': '', 'ig': '', 'yo': ''}
     }
 
+# Initialize editing state
+if 'editing_exam_id' not in st.session_state:
+    st.session_state.editing_exam_id = None
+
+if 'viewing_exam_id' not in st.session_state:
+    st.session_state.viewing_exam_id = None
+
 # Helper functions
 def reset_current_question():
     """Reset the current question form"""
@@ -257,23 +292,200 @@ def validate_question(question_data: Dict) -> List[str]:
     
     return errors
 
-async def save_exam_to_database(exam_data: Dict, questions: List[Dict]) -> Optional[str]:
+def save_exam_to_database(exam_data: Dict, questions: List[Dict]) -> Optional[str]:
     """Save exam and questions to database"""
+    db = SyncSessionLocal()
     try:
-        async with AsyncSessionLocal() as db:
-            # Create exam
-            exam = Exam(
-                exam_type=ExamType(exam_data['exam_type']),
-                subject=exam_data['subject'],
-                year=exam_data['year'],
-                title=exam_data['title'],
-                duration=exam_data['duration']
+        # Create exam
+        exam = Exam(
+            exam_type=ExamType(exam_data['exam_type']),
+            subject=exam_data['subject'],
+            year=exam_data['year'],
+            title=exam_data['title'],
+            duration=exam_data['duration']
+        )
+        
+        db.add(exam)
+        db.flush()  # Get the exam ID
+        
+        # Create questions
+        for i, question_data in enumerate(questions, 1):
+            question = Question(
+                exam_id=exam.id,
+                number=i,
+                question=question_data['question'],
+                options=question_data['options'],
+                answer=question_data['answer'],
+                explanation=question_data['explanation'],
+                verbose=question_data['verbose']
             )
+            db.add(question)
+        
+        db.commit()
+        return str(exam.id)
             
-            db.add(exam)
-            await db.flush()  # Get the exam ID
+    except Exception as e:
+        db.rollback()
+        st.error(f"Error saving to database: {str(e)}")
+        return None
+    finally:
+        db.close()
+
+def fetch_all_exams(
+    exam_type: Optional[str] = None,
+    subject: Optional[str] = None,
+    year: Optional[int] = None,
+    search_title: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0
+) -> List[Dict]:
+    """Fetch all exams from database with optional filters"""
+    db = SyncSessionLocal()
+    try:
+        query = select(Exam)
+        
+        # Apply filters
+        if exam_type:
+            query = query.where(Exam.exam_type == ExamType(exam_type))
+        if subject:
+            query = query.where(Exam.subject == subject)
+        if year:
+            query = query.where(Exam.year == year)
+        if search_title:
+            query = query.where(Exam.title.ilike(f"%{search_title}%"))
+        
+        # Order by created_at descending
+        query = query.order_by(Exam.created_at.desc())
+        
+        # Apply pagination
+        query = query.limit(limit).offset(offset)
+        
+        result = db.execute(query)
+        exams = result.scalars().all()
+        
+        # Get question counts for each exam
+        exam_list = []
+        for exam in exams:
+            # Count questions for this exam
+            count_query = select(func.count(Question.id)).where(Question.exam_id == exam.id)
+            count_result = db.execute(count_query)
+            question_count = count_result.scalar() or 0
             
-            # Create questions
+            exam_list.append({
+                'id': str(exam.id),
+                'exam_type': exam.exam_type.value if exam.exam_type else None,
+                'subject': exam.subject,
+                'year': exam.year,
+                'title': exam.title,
+                'duration': exam.duration,
+                'created_at': exam.created_at.isoformat() if exam.created_at else None,
+                'question_count': question_count
+            })
+        
+        return exam_list
+    except Exception as e:
+        st.error(f"Error fetching exams: {str(e)}")
+        return []
+    finally:
+        db.close()
+
+def fetch_exam_by_id(exam_id: str) -> Optional[Dict]:
+    """Fetch a single exam by ID"""
+    db = SyncSessionLocal()
+    try:
+        query = select(Exam).where(Exam.id == uuid.UUID(exam_id))
+        result = db.execute(query)
+        exam = result.scalar_one_or_none()
+        
+        if exam:
+            return {
+                'id': str(exam.id),
+                'exam_type': exam.exam_type.value if exam.exam_type else None,
+                'subject': exam.subject,
+                'year': exam.year,
+                'title': exam.title,
+                'duration': exam.duration,
+                'created_at': exam.created_at.isoformat() if exam.created_at else None
+            }
+        return None
+    except Exception as e:
+        st.error(f"Error fetching exam: {str(e)}")
+        return None
+    finally:
+        db.close()
+
+def fetch_exam_questions(exam_id: str) -> List[Dict]:
+    """Fetch all questions for a specific exam"""
+    db = SyncSessionLocal()
+    try:
+        query = select(Question).where(Question.exam_id == uuid.UUID(exam_id)).order_by(Question.number)
+        result = db.execute(query)
+        questions = result.scalars().all()
+        
+        question_list = []
+        for q in questions:
+            question_list.append({
+                'id': str(q.id),
+                'number': q.number,
+                'question': q.question if isinstance(q.question, dict) else json.loads(q.question) if isinstance(q.question, str) else {},
+                'options': q.options if isinstance(q.options, dict) else json.loads(q.options) if isinstance(q.options, str) else {},
+                'answer': q.answer,
+                'explanation': q.explanation if isinstance(q.explanation, dict) else json.loads(q.explanation) if isinstance(q.explanation, str) else {},
+                'verbose': q.verbose if isinstance(q.verbose, dict) else json.loads(q.verbose) if isinstance(q.verbose, str) else {}
+            })
+        
+        return question_list
+    except Exception as e:
+        st.error(f"Error fetching questions: {str(e)}")
+        return []
+    finally:
+        db.close()
+
+def update_question_in_db(question_id: str, question_data: Dict) -> bool:
+    """Update a single question in the database"""
+    db = SyncSessionLocal()
+    try:
+        query = select(Question).where(Question.id == uuid.UUID(question_id))
+        result = db.execute(query)
+        question = result.scalar_one_or_none()
+        
+        if question:
+            question.question = question_data['question']
+            question.options = question_data['options']
+            question.answer = question_data['answer']
+            question.explanation = question_data.get('explanation', {})
+            question.verbose = question_data.get('verbose', {})
+            
+            db.commit()
+            return True
+        return False
+    except Exception as e:
+        db.rollback()
+        st.error(f"Error updating question: {str(e)}")
+        return False
+    finally:
+        db.close()
+
+def update_exam_in_db(exam_id: str, exam_data: Dict, questions: List[Dict]) -> bool:
+    """Update exam metadata and questions in the database"""
+    db = SyncSessionLocal()
+    try:
+        # Update exam
+        query = select(Exam).where(Exam.id == uuid.UUID(exam_id))
+        result = db.execute(query)
+        exam = result.scalar_one_or_none()
+        
+        if exam:
+            exam.exam_type = ExamType(exam_data['exam_type'])
+            exam.subject = exam_data['subject']
+            exam.year = exam_data['year']
+            exam.title = exam_data['title']
+            exam.duration = exam_data['duration']
+            
+            # Delete existing questions
+            db.execute(delete(Question).where(Question.exam_id == exam.id))
+            
+            # Add updated questions
             for i, question_data in enumerate(questions, 1):
                 question = Question(
                     exam_id=exam.id,
@@ -286,12 +498,78 @@ async def save_exam_to_database(exam_data: Dict, questions: List[Dict]) -> Optio
                 )
                 db.add(question)
             
-            await db.commit()
-            return str(exam.id)
-            
+            db.commit()
+            return True
+        return False
     except Exception as e:
-        st.error(f"Error saving to database: {str(e)}")
-        return None
+        db.rollback()
+        st.error(f"Error updating exam: {str(e)}")
+        return False
+    finally:
+        db.close()
+
+def delete_exam_from_db(exam_id: str) -> bool:
+    """Delete an exam and all its questions from the database"""
+    db = SyncSessionLocal()
+    try:
+        # Delete questions first (cascade should handle this, but being explicit)
+        db.execute(delete(Question).where(Question.exam_id == uuid.UUID(exam_id)))
+        
+        # Delete exam
+        db.execute(delete(Exam).where(Exam.id == uuid.UUID(exam_id)))
+        
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        st.error(f"Error deleting exam: {str(e)}")
+        return False
+    finally:
+        db.close()
+
+def delete_question_from_db(question_id: str) -> bool:
+    """Delete a single question from the database"""
+    db = SyncSessionLocal()
+    try:
+        db.execute(delete(Question).where(Question.id == uuid.UUID(question_id)))
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        st.error(f"Error deleting question: {str(e)}")
+        return False
+    finally:
+        db.close()
+
+def add_question_to_exam(exam_id: str, question_data: Dict) -> bool:
+    """Add a new question to an existing exam"""
+    db = SyncSessionLocal()
+    try:
+        # Get the current max question number for this exam
+        query = select(func.max(Question.number)).where(Question.exam_id == uuid.UUID(exam_id))
+        result = db.execute(query)
+        max_number = result.scalar() or 0
+        
+        # Create new question
+        question = Question(
+            exam_id=uuid.UUID(exam_id),
+            number=max_number + 1,
+            question=question_data['question'],
+            options=question_data['options'],
+            answer=question_data['answer'],
+            explanation=question_data.get('explanation', {}),
+            verbose=question_data.get('verbose', {})
+        )
+        
+        db.add(question)
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        st.error(f"Error adding question: {str(e)}")
+        return False
+    finally:
+        db.close()
 
 # Main interface
 def main():
@@ -342,6 +620,7 @@ def main():
     # Setup navigation using st.navigation
     pages = [
         st.Page(create_exam_page, title="Create Exam"),
+        st.Page(browse_exams_page, title="Browse Exams"),
         st.Page(view_questions_page, title="View Questions"),
         st.Page(database_status_page, title="Database Status")
     ]
@@ -374,6 +653,23 @@ def create_exam_page():
             st.session_state.needs_save = False
         except Exception:
             pass
+    
+    # Show editing mode indicator
+    if st.session_state.get('editing_exam_id'):
+        st.info(f"📝 **Editing Mode:** You are editing an existing exam. Changes will update the exam in the database.")
+        if st.button("❌ Cancel Editing", type="secondary"):
+            st.session_state.editing_exam_id = None
+            default_year = min(datetime.now().year, max(EXAM_YEARS)) if datetime.now().year <= max(EXAM_YEARS) else max(EXAM_YEARS)
+            st.session_state.exam_data = {
+                'exam_type': None,
+                'subject': '',
+                'year': default_year,
+                'title': '',
+                'duration': 60
+            }
+            st.session_state.questions = []
+            reset_current_question()
+            st.rerun()
     
     st.markdown('<h2 class="section-header">Exam Details</h2>', unsafe_allow_html=True)
     
@@ -565,7 +861,10 @@ def create_exam_page():
             clear_form = st.form_submit_button("🗑️ Clear Form")
         
         with col3:
-            save_exam = st.form_submit_button("💾 Save Exam to Database", type="secondary")
+            if st.session_state.get('editing_exam_id'):
+                save_exam = st.form_submit_button("🔄 Update Exam in Database", type="primary")
+            else:
+                save_exam = st.form_submit_button("💾 Save Exam to Database", type="secondary")
         
         # Handle form submissions
         if add_question:
@@ -607,32 +906,67 @@ def create_exam_page():
             else:
                 # Ensure title is generated
                 update_exam_title()
-                # Save to database
-                with st.spinner("Saving exam to database..."):
-                    exam_id = asyncio.run(save_exam_to_database(
-                        st.session_state.exam_data,
-                        st.session_state.questions
-                    ))
                 
-                if exam_id:
-                    st.success(f"🎉 Exam saved successfully! Exam ID: {exam_id}")
-                    # Reset session state first
-                    default_year = min(datetime.now().year, max(EXAM_YEARS)) if datetime.now().year <= max(EXAM_YEARS) else max(EXAM_YEARS)
-                    st.session_state.exam_data = {
-                        'exam_type': None,
-                        'subject': '',
-                        'year': default_year,
-                        'title': '',
-                        'duration': 60
-                    }
-                    st.session_state.questions = []
-                    reset_current_question()
-                    st.session_state.auto_saved = False
-                    # Mark that localStorage should be cleared
-                    st.session_state.should_clear_storage = True
-                    st.rerun()
+                # Check if updating existing exam or creating new one
+                editing_exam_id = st.session_state.get('editing_exam_id')
+                
+                if editing_exam_id:
+                    # Update existing exam
+                    with st.spinner("Updating exam in database..."):
+                        success = update_exam_in_db(
+                            editing_exam_id,
+                            st.session_state.exam_data,
+                            st.session_state.questions
+                        )
+                    
+                    if success:
+                        st.success(f"🎉 Exam updated successfully! Exam ID: {editing_exam_id}")
+                        # Reset editing state
+                        st.session_state.editing_exam_id = None
+                        # Reset session state
+                        default_year = min(datetime.now().year, max(EXAM_YEARS)) if datetime.now().year <= max(EXAM_YEARS) else max(EXAM_YEARS)
+                        st.session_state.exam_data = {
+                            'exam_type': None,
+                            'subject': '',
+                            'year': default_year,
+                            'title': '',
+                            'duration': 60
+                        }
+                        st.session_state.questions = []
+                        reset_current_question()
+                        st.session_state.auto_saved = False
+                        # Mark that localStorage should be cleared
+                        st.session_state.should_clear_storage = True
+                        st.rerun()
+                    else:
+                        st.error("❌ Failed to update exam in database")
                 else:
-                    st.error("❌ Failed to save exam to database")
+                    # Create new exam
+                    with st.spinner("Saving exam to database..."):
+                        exam_id = save_exam_to_database(
+                            st.session_state.exam_data,
+                            st.session_state.questions
+                        )
+                    
+                    if exam_id:
+                        st.success(f"🎉 Exam saved successfully! Exam ID: {exam_id}")
+                        # Reset session state first
+                        default_year = min(datetime.now().year, max(EXAM_YEARS)) if datetime.now().year <= max(EXAM_YEARS) else max(EXAM_YEARS)
+                        st.session_state.exam_data = {
+                            'exam_type': None,
+                            'subject': '',
+                            'year': default_year,
+                            'title': '',
+                            'duration': 60
+                        }
+                        st.session_state.questions = []
+                        reset_current_question()
+                        st.session_state.auto_saved = False
+                        # Mark that localStorage should be cleared
+                        st.session_state.should_clear_storage = True
+                        st.rerun()
+                    else:
+                        st.error("❌ Failed to save exam to database")
     
     # Clear localStorage if exam was successfully saved to database
     if st.session_state.get('should_clear_storage', False):
@@ -819,18 +1153,389 @@ def view_questions_page():
                     st.success(f"Question {i+1} moved to edit form!")
                     st.rerun()
 
+def question_editor(question_data: Dict, question_id: Optional[str] = None, exam_id: Optional[str] = None, on_save=None, on_cancel=None):
+    """Reusable question editor component"""
+    with st.form(f"question_editor_{question_id or 'new'}", clear_on_submit=False):
+        st.markdown("### Edit Question")
+        
+        # Question text
+        question_en = st.text_area(
+            "Question (English)",
+            value=question_data.get('question', {}).get('en', ''),
+            height=100,
+            key=f"q_question_{question_id}"
+        )
+        
+        # Options
+        col1, col2 = st.columns(2)
+        with col1:
+            option_a = st.text_input("Option A", value=question_data.get('options', {}).get('A', ''), key=f"q_opt_a_{question_id}")
+            option_b = st.text_input("Option B", value=question_data.get('options', {}).get('B', ''), key=f"q_opt_b_{question_id}")
+        with col2:
+            option_c = st.text_input("Option C", value=question_data.get('options', {}).get('C', ''), key=f"q_opt_c_{question_id}")
+            option_d = st.text_input("Option D", value=question_data.get('options', {}).get('D', ''), key=f"q_opt_d_{question_id}")
+        
+        # Correct answer
+        current_answer = question_data.get('answer', 'A')
+        answer_index = ['A', 'B', 'C', 'D'].index(current_answer) if current_answer in ['A', 'B', 'C', 'D'] else 0
+        correct_answer = st.selectbox(
+            "Correct Answer",
+            options=['A', 'B', 'C', 'D'],
+            index=answer_index,
+            key=f"q_answer_{question_id}"
+        )
+        
+        # Explanation
+        explanation_en = st.text_area(
+            "Explanation (English)",
+            value=question_data.get('explanation', {}).get('en', ''),
+            height=100,
+            key=f"q_explanation_{question_id}"
+        )
+        
+        # Buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            save_btn = st.form_submit_button("💾 Save", type="primary")
+        with col2:
+            cancel_btn = st.form_submit_button("❌ Cancel")
+        
+        if save_btn:
+            # Validate
+            updated_data = {
+                'question': {'en': question_en, 'ha': question_data.get('question', {}).get('ha', ''), 
+                            'ig': question_data.get('question', {}).get('ig', ''), 
+                            'yo': question_data.get('question', {}).get('yo', '')},
+                'options': {'A': option_a, 'B': option_b, 'C': option_c, 'D': option_d},
+                'answer': correct_answer,
+                'explanation': {'en': explanation_en, 'ha': question_data.get('explanation', {}).get('ha', ''),
+                               'ig': question_data.get('explanation', {}).get('ig', ''),
+                               'yo': question_data.get('explanation', {}).get('yo', '')},
+                'verbose': question_data.get('verbose', {})
+            }
+            
+            errors = validate_question(updated_data)
+            if errors:
+                for error in errors:
+                    st.error(error)
+            else:
+                if on_save:
+                    on_save(question_id, updated_data)
+        
+        if cancel_btn:
+            if on_cancel:
+                on_cancel()
+
+def exam_detail_view(exam_id: str):
+    """Display exam details and questions with editing capabilities"""
+    # Fetch exam data
+    exam = fetch_exam_by_id(exam_id)
+    if not exam:
+        st.error("Exam not found")
+        return
+    
+    # Display exam metadata
+    st.markdown('<h2 class="section-header">Exam Details</h2>', unsafe_allow_html=True)
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Exam Type", exam['exam_type'] or 'N/A')
+    with col2:
+        st.metric("Subject", exam['subject'] or 'N/A')
+    with col3:
+        st.metric("Year", exam['year'] or 'N/A')
+    with col4:
+        st.metric("Duration", f"{exam['duration']} min" if exam['duration'] else 'N/A')
+    
+    st.info(f"**Title:** {exam['title']}")
+    
+    # Action buttons
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("📥 Load for Bulk Edit", type="primary"):
+            # Load exam into session
+            questions = fetch_exam_questions(exam_id)
+            st.session_state.exam_data = {
+                'exam_type': exam['exam_type'],
+                'subject': exam['subject'],
+                'year': exam['year'],
+                'title': exam['title'],
+                'duration': exam['duration']
+            }
+            st.session_state.questions = questions
+            st.session_state.editing_exam_id = exam_id
+            st.session_state.viewing_exam_id = None
+            st.success("Exam loaded! Switch to 'Create Exam' page to edit.")
+            st.rerun()
+    
+    with col2:
+        if st.button("🔄 Refresh", type="secondary"):
+            st.rerun()
+    
+    with col3:
+        if st.button("🗑️ Delete Exam", type="secondary"):
+            st.session_state.delete_exam_confirm = exam_id
+    
+    # Delete confirmation
+    if st.session_state.get('delete_exam_confirm') == exam_id:
+        st.warning("⚠️ Are you sure you want to delete this exam and all its questions?")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Yes, Delete", type="primary"):
+                if delete_exam_from_db(exam_id):
+                    st.success("Exam deleted successfully!")
+                    st.session_state.viewing_exam_id = None
+                    st.session_state.delete_exam_confirm = None
+                    st.rerun()
+                else:
+                    st.error("Failed to delete exam")
+        with col2:
+            if st.button("❌ Cancel", type="secondary"):
+                st.session_state.delete_exam_confirm = None
+                st.rerun()
+    
+    # Fetch and display questions
+    st.markdown('<h2 class="section-header">Questions</h2>', unsafe_allow_html=True)
+    
+    questions = fetch_exam_questions(exam_id)
+    
+    if not questions:
+        st.info("No questions found for this exam.")
+        
+        # Add new question button
+        if st.button("➕ Add Question", type="primary"):
+            st.session_state.adding_question_to_exam = exam_id
+            st.rerun()
+    else:
+        st.metric("Total Questions", len(questions))
+        
+        # Add new question button
+        if st.button("➕ Add New Question", type="primary"):
+            st.session_state.adding_question_to_exam = exam_id
+            st.rerun()
+        
+        # Display questions
+        for i, question in enumerate(questions):
+            with st.container():
+                st.markdown("---")
+                col1, col2 = st.columns([8, 1])
+                
+                with col1:
+                    question_preview = question['question'].get('en', '')[:80] + "..." if len(question['question'].get('en', '')) > 80 else question['question'].get('en', '')
+                    st.markdown(f"**Question {question['number']}:** {question_preview}")
+                
+                with col2:
+                    if st.button("🗑️", key=f"del_q_{question['id']}", help="Delete question"):
+                        if delete_question_from_db(question['id']):
+                            st.success(f"Question {question['number']} deleted!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to delete question")
+                
+                # Expandable question details
+                with st.expander(f"View/Edit Question {question['number']}", expanded=False):
+                    if st.session_state.get(f"editing_question_{question['id']}"):
+                        # Show editor
+                        def save_question(q_id, q_data):
+                            if update_question_in_db(q_id, q_data):
+                                st.session_state[f"editing_question_{q_id}"] = False
+                                st.success("Question updated!")
+                                st.rerun()
+                            else:
+                                st.error("Failed to update question")
+                        
+                        def cancel_edit():
+                            st.session_state[f"editing_question_{question['id']}"] = False
+                            st.rerun()
+                        
+                        question_editor(question, question['id'], exam_id, save_question, cancel_edit)
+                    else:
+                        # Show question details
+                        st.markdown("**Question:**")
+                        st.write(question['question'].get('en', 'N/A'))
+                        
+                        st.markdown("**Options:**")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            for opt in ['A', 'B']:
+                                marker = "✅" if opt == question['answer'] else "⚪"
+                                st.write(f"{marker} {opt}: {question['options'].get(opt, 'N/A')}")
+                        with col2:
+                            for opt in ['C', 'D']:
+                                marker = "✅" if opt == question['answer'] else "⚪"
+                                st.write(f"{marker} {opt}: {question['options'].get(opt, 'N/A')}")
+                        
+                        st.markdown("**Explanation:**")
+                        st.write(question['explanation'].get('en', 'N/A'))
+                        
+                        if st.button(f"✏️ Edit Question {question['number']}", key=f"edit_btn_{question['id']}"):
+                            st.session_state[f"editing_question_{question['id']}"] = True
+                            st.rerun()
+    
+    # Handle adding new question
+    if st.session_state.get('adding_question_to_exam') == exam_id:
+        st.markdown("### Add New Question")
+        new_question_data = {
+            'question': {'en': '', 'ha': '', 'ig': '', 'yo': ''},
+            'options': {'A': '', 'B': '', 'C': '', 'D': ''},
+            'answer': 'A',
+            'explanation': {'en': '', 'ha': '', 'ig': '', 'yo': ''},
+            'verbose': {'en': '', 'ha': '', 'ig': '', 'yo': ''}
+        }
+        
+        def save_new_question(q_id, q_data):
+            if add_question_to_exam(exam_id, q_data):
+                st.session_state.adding_question_to_exam = None
+                st.success("Question added!")
+                st.rerun()
+            else:
+                st.error("Failed to add question")
+        
+        def cancel_add():
+            st.session_state.adding_question_to_exam = None
+            st.rerun()
+        
+        question_editor(new_question_data, None, exam_id, save_new_question, cancel_add)
+
+def browse_exams_page():
+    """Browse and manage exams from the database"""
+    st.markdown('<h2 class="section-header">Browse Exams</h2>', unsafe_allow_html=True)
+    
+    # Check if viewing a specific exam
+    if st.session_state.get('viewing_exam_id'):
+        if st.button("← Back to Exam List"):
+            st.session_state.viewing_exam_id = None
+            st.rerun()
+        exam_detail_view(st.session_state.viewing_exam_id)
+        return
+    
+    # Filters
+    st.markdown("### Filters")
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        exam_type_filter = st.selectbox(
+            "Exam Type",
+            options=[None] + [e.value for e in ExamType],
+            format_func=lambda x: "All" if x is None else x
+        )
+    
+    with col2:
+        subject_filter = st.selectbox(
+            "Subject",
+            options=[None] + SUBJECTS,
+            format_func=lambda x: "All" if x is None else x
+        )
+    
+    with col3:
+        year_filter = st.selectbox(
+            "Year",
+            options=[None] + EXAM_YEARS,
+            format_func=lambda x: "All" if x is None else str(x)
+        )
+    
+    with col4:
+        search_title = st.text_input("Search Title", placeholder="Search by title...")
+    
+    # Fetch exams
+    with st.spinner("Loading exams..."):
+        exams = fetch_all_exams(
+            exam_type=exam_type_filter,
+            subject=subject_filter,
+            year=year_filter,
+            search_title=search_title if search_title else None
+        )
+    
+    if not exams:
+        st.info("No exams found matching the filters.")
+        return
+    
+    st.metric("Total Exams Found", len(exams))
+    
+    # Display exams in a table-like format
+    st.markdown("### Exam List")
+    
+    for exam in exams:
+        with st.container():
+            col1, col2, col3, col4, col5 = st.columns([2, 1.5, 1, 1, 2])
+            
+            with col1:
+                st.markdown(f"**{exam['title'] or 'Untitled'}**")
+                st.caption(f"ID: {exam['id'][:8]}...")
+            
+            with col2:
+                st.write(f"**Type:** {exam['exam_type'] or 'N/A'}")
+                st.write(f"**Subject:** {exam['subject'] or 'N/A'}")
+            
+            with col3:
+                st.write(f"**Year:** {exam['year'] or 'N/A'}")
+                st.write(f"**Questions:** {exam['question_count']}")
+            
+            with col4:
+                if exam['created_at']:
+                    created_date = datetime.fromisoformat(exam['created_at']).strftime("%Y-%m-%d")
+                    st.write(f"**Created:** {created_date}")
+            
+            with col5:
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    if st.button("👁️ View", key=f"view_{exam['id']}"):
+                        st.session_state.viewing_exam_id = exam['id']
+                        st.rerun()
+                with col_b:
+                    if st.button("📥 Load", key=f"load_{exam['id']}"):
+                        # Load exam into session
+                        questions = fetch_exam_questions(exam['id'])
+                        st.session_state.exam_data = {
+                            'exam_type': exam['exam_type'],
+                            'subject': exam['subject'],
+                            'year': exam['year'],
+                            'title': exam['title'],
+                            'duration': exam['duration']
+                        }
+                        st.session_state.questions = questions
+                        st.session_state.editing_exam_id = exam['id']
+                        st.success("Exam loaded! Switch to 'Create Exam' page to edit.")
+                        st.rerun()
+                with col_c:
+                    if st.button("🗑️", key=f"del_{exam['id']}", help="Delete"):
+                        st.session_state.delete_exam_id = exam['id']
+            
+            st.markdown("---")
+    
+    # Delete confirmation dialog
+    if st.session_state.get('delete_exam_id'):
+        exam_to_delete = st.session_state.delete_exam_id
+        st.warning(f"⚠️ Are you sure you want to delete this exam? This action cannot be undone.")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Yes, Delete", type="primary"):
+                if delete_exam_from_db(exam_to_delete):
+                    st.success("Exam deleted successfully!")
+                    st.session_state.delete_exam_id = None
+                    st.rerun()
+                else:
+                    st.error("Failed to delete exam")
+        with col2:
+            if st.button("❌ Cancel", type="secondary"):
+                st.session_state.delete_exam_id = None
+                st.rerun()
+
 def database_status_page():
     st.markdown('<h2 class="section-header">Database Status</h2>', unsafe_allow_html=True)
     
     # Test database connection
     with st.spinner("Testing database connection..."):
         try:
-            async def test_connection():
-                async with AsyncSessionLocal() as db:
-                    result = await db.execute(text("SELECT 1"))
+            def test_connection():
+                db = SyncSessionLocal()
+                try:
+                    result = db.execute(text("SELECT 1"))
                     return True
+                finally:
+                    db.close()
             
-            connection_ok = asyncio.run(test_connection())
+            connection_ok = test_connection()
             
             if connection_ok:
                 st.success("✅ Database connection successful!")
