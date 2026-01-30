@@ -17,7 +17,9 @@ from utils import (
     delete_exam_from_db,
     delete_question_from_db,
     add_question_to_exam,
-    test_database_connection
+    test_database_connection,
+    upload_media_to_r2,
+    r2_configured,
 )
 
 # Import localStorage functionality
@@ -223,7 +225,9 @@ if 'current_question' not in st.session_state:
         'options': {'A': '', 'B': '', 'C': '', 'D': ''},
         'answer': 'A',
         'explanation': {'en': '', 'ha': '', 'ig': '', 'yo': ''},
-        'verbose': {'en': '', 'ha': '', 'ig': '', 'yo': ''}
+        'verbose': {'en': '', 'ha': '', 'ig': '', 'yo': ''},
+        'question_image_url': None,
+        'option_image_urls': {},
     }
 
 # Initialize editing state
@@ -233,6 +237,10 @@ if 'editing_exam_id' not in st.session_state:
 if 'viewing_exam_id' not in st.session_state:
     st.session_state.viewing_exam_id = None
 
+# Key for file uploaders; bump after save/update so widgets remount and clear
+if 'file_upload_key' not in st.session_state:
+    st.session_state.file_upload_key = 0
+
 # Helper functions
 def reset_current_question():
     """Reset the current question form"""
@@ -241,8 +249,14 @@ def reset_current_question():
         'options': {'A': '', 'B': '', 'C': '', 'D': ''},
         'answer': 'A',
         'explanation': {'en': '', 'ha': '', 'ig': '', 'yo': ''},
-        'verbose': {'en': '', 'ha': '', 'ig': '', 'yo': ''}
+        'verbose': {'en': '', 'ha': '', 'ig': '', 'yo': ''},
+        'question_image_url': None,
+        'option_image_urls': {},
     }
+    # Clear upload tracking so next question can upload fresh
+    st.session_state.pop("_q_img_uploaded", None)
+    for opt in ["A", "B", "C", "D"]:
+        st.session_state.pop(f"_opt_img_uploaded_{opt}", None)
 
 # Main interface
 def main():
@@ -456,6 +470,86 @@ def create_exam_page():
         st.success(f"✅ Question {total_questions} added successfully! Total questions: {total_questions}")
         st.session_state.question_added_success = False  # Reset flag after showing
     
+    # Images: upload → URL stored for question payload (internal tool, minimal labels)
+    if st.session_state.get("upload_error"):
+        st.error("Upload failed: " + st.session_state["upload_error"])
+    if not r2_configured():
+        st.caption("Set CLOUDFLARE_* env vars to enable image uploads.")
+    MAX_FILE_BYTES = 300 * 1024  # 300 KB
+    _uk = st.session_state.file_upload_key
+    q_upload = st.file_uploader(
+        "Q",
+        type=["png", "jpg", "jpeg", "gif", "webp"],
+        key=f"q_img_upload_{_uk}",
+        help="",
+    )
+    if q_upload is not None and r2_configured():
+        if getattr(q_upload, "size", 0) > MAX_FILE_BYTES:
+            st.session_state["upload_error"] = "File must be 300 KB or smaller."
+        else:
+            last = st.session_state.get("_q_img_uploaded")
+            if last != q_upload.name:
+                with st.spinner("Uploading..."):
+                    urls = upload_media_to_r2([q_upload])
+                if urls and urls[0]:
+                    st.session_state.current_question["question_image_url"] = urls[0]
+                    st.session_state["_q_img_uploaded"] = q_upload.name
+                    st.session_state.pop("upload_error", None)
+                    # Don't rerun: allow form submit (Add/Update) to process in same run
+            # else: upload_error already set; shown at top above
+    if st.session_state.current_question.get("question_image_url"):
+        col_img, col_clear = st.columns([3, 1])
+        with col_img:
+            st.image(st.session_state.current_question["question_image_url"], width=180)
+        with col_clear:
+            if st.button("Clear", key="rm_q_img"):
+                st.session_state.current_question["question_image_url"] = None
+                st.session_state.pop("_q_img_uploaded", None)
+                st.rerun()
+
+    opt_uploads = {}
+    c1, c2, c3, c4 = st.columns(4)
+    for i, opt in enumerate(["A", "B", "C", "D"]):
+        with [c1, c2, c3, c4][i]:
+            opt_uploads[opt] = st.file_uploader(
+                opt,
+                type=["png", "jpg", "jpeg", "gif", "webp"],
+                key=f"opt_upload_{opt}_{_uk}",
+                help="",
+            )
+    if r2_configured():
+        for opt in ["A", "B", "C", "D"]:
+            f = opt_uploads.get(opt)
+            if f is not None:
+                if getattr(f, "size", 0) > MAX_FILE_BYTES:
+                    st.session_state["upload_error"] = f"Option {opt}: file must be 300 KB or smaller."
+                else:
+                    last = st.session_state.get(f"_opt_img_uploaded_{opt}")
+                    if last != f.name:
+                        with st.spinner("Uploading..."):
+                            urls = upload_media_to_r2([f])
+                        if urls and urls[0]:
+                            if "option_image_urls" not in st.session_state.current_question:
+                                st.session_state.current_question["option_image_urls"] = {}
+                            st.session_state.current_question["option_image_urls"][opt] = urls[0]
+                            st.session_state[f"_opt_img_uploaded_{opt}"] = f.name
+                            st.session_state.pop("upload_error", None)
+                            # Don't rerun: allow form submit (Add/Update) to process in same run
+                    # else: upload_error already set; shown at top
+    # Show option thumbnails in a row
+    opt_urls = st.session_state.current_question.get("option_image_urls") or {}
+    if any(opt_urls.get(o) for o in ["A", "B", "C", "D"]):
+        o1, o2, o3, o4 = st.columns(4)
+        for i, opt in enumerate(["A", "B", "C", "D"]):
+            with [o1, o2, o3, o4][i]:
+                if opt_urls.get(opt):
+                    st.image(opt_urls[opt], caption=opt, width=100)
+                    if st.button("Clear", key=f"rm_opt_{opt}"):
+                        st.session_state.current_question.setdefault("option_image_urls", {}).pop(opt, None)
+                        st.session_state.pop(f"_opt_img_uploaded_{opt}", None)
+                        st.rerun()
+    
+    st.markdown("**Question details**")
     # Question form
     with st.form("question_form", clear_on_submit=True):
         
@@ -523,7 +617,7 @@ def create_exam_page():
             help="Enter the explanation for the correct answer"
         )
         st.session_state.current_question['explanation']['en'] = explanation_en
-        
+
         # Form buttons
         col1, col2, col3 = st.columns(3)
         
@@ -548,22 +642,27 @@ def create_exam_page():
                 for error in errors:
                     st.error(error)
             else:
-                # Add question to list
+                # Add question to list (preserve verbose_audio if present, e.g. after load-for-edit)
                 question_copy = {
                     'question': st.session_state.current_question['question'].copy(),
                     'options': st.session_state.current_question['options'].copy(),
                     'answer': st.session_state.current_question['answer'],
                     'explanation': st.session_state.current_question['explanation'].copy(),
-                    'verbose': st.session_state.current_question['verbose'].copy()
+                    'verbose': (st.session_state.current_question.get('verbose') or {}).copy() if isinstance(st.session_state.current_question.get('verbose'), dict) else {},
+                    'verbose_audio': dict(st.session_state.current_question.get('verbose_audio') or {}),
+                    'question_image_url': st.session_state.current_question.get('question_image_url'),
+                    'option_image_urls': dict(st.session_state.current_question.get('option_image_urls') or {}),
                 }
                 st.session_state.questions.append(question_copy)
                 save_exam_to_storage()  # Auto-save after adding question
                 reset_current_question()
+                st.session_state.file_upload_key = st.session_state.get("file_upload_key", 0) + 1
                 st.session_state.question_added_success = True
                 st.rerun()
         
         if clear_form:
             reset_current_question()
+            st.session_state.file_upload_key = st.session_state.get("file_upload_key", 0) + 1
             st.rerun()
         
         if save_exam:
@@ -607,6 +706,7 @@ def create_exam_page():
                         }
                         st.session_state.questions = []
                         reset_current_question()
+                        st.session_state.file_upload_key = st.session_state.get("file_upload_key", 0) + 1
                         st.session_state.auto_saved = False
                         # Mark that localStorage should be cleared
                         st.session_state.should_clear_storage = True
@@ -617,29 +717,30 @@ def create_exam_page():
                     # Create new exam
                     with st.spinner("Saving exam to database..."):
                         exam_id = save_exam_to_database(
-                            st.session_state.exam_data,
-                            st.session_state.questions
+                        st.session_state.exam_data,
+                        st.session_state.questions
                         )
-                    
-                    if exam_id:
-                        st.success(f"🎉 Exam saved successfully! Exam ID: {exam_id}")
-                        # Reset session state first
-                        default_year = min(datetime.now().year, max(EXAM_YEARS)) if datetime.now().year <= max(EXAM_YEARS) else max(EXAM_YEARS)
-                        st.session_state.exam_data = {
-                            'exam_type': None,
-                            'subject': '',
-                            'year': default_year,
-                            'title': '',
-                            'duration': 60
-                        }
-                        st.session_state.questions = []
-                        reset_current_question()
-                        st.session_state.auto_saved = False
-                        # Mark that localStorage should be cleared
-                        st.session_state.should_clear_storage = True
-                        st.rerun()
-                    else:
-                        st.error("❌ Failed to save exam to database")
+                
+                if exam_id:
+                    st.success(f"🎉 Exam saved successfully! Exam ID: {exam_id}")
+                    # Reset session state first
+                    default_year = min(datetime.now().year, max(EXAM_YEARS)) if datetime.now().year <= max(EXAM_YEARS) else max(EXAM_YEARS)
+                    st.session_state.exam_data = {
+                        'exam_type': None,
+                        'subject': '',
+                        'year': default_year,
+                        'title': '',
+                        'duration': 60
+                    }
+                    st.session_state.questions = []
+                    reset_current_question()
+                    st.session_state.file_upload_key = st.session_state.get("file_upload_key", 0) + 1
+                    st.session_state.auto_saved = False
+                    # Mark that localStorage should be cleared
+                    st.session_state.should_clear_storage = True
+                    st.rerun()
+                else:
+                    st.error("❌ Failed to save exam to database")
     
     # Clear localStorage if exam was successfully saved to database
     if st.session_state.get('should_clear_storage', False):
@@ -793,19 +894,24 @@ def view_questions_page():
             with st.expander(f"View Details - Question {i+1}", expanded=False):
                 st.markdown("**Question:**")
                 st.write(question['question']['en'])
-                
+                q_img_url = (question.get('question_image_url') or '').strip()
+                if q_img_url:
+                    st.image(q_img_url, caption="Question image", width=200)
                 st.markdown("**Options:**")
                 col1, col2 = st.columns(2)
-                
+                opt_imgs = question.get('option_image_urls') or {}
                 with col1:
                     for option in ['A', 'B']:
                         marker = "✅" if option == question['answer'] else "⚪"
                         st.write(f"{marker} {option}: {question['options'][option]}")
-                
+                        if (opt_imgs.get(option) or '').strip():
+                            st.image((opt_imgs.get(option) or '').strip(), caption=option, width=120)
                 with col2:
                     for option in ['C', 'D']:
                         marker = "✅" if option == question['answer'] else "⚪"
                         st.write(f"{marker} {option}: {question['options'][option]}")
+                        if (opt_imgs.get(option) or '').strip():
+                            st.image((opt_imgs.get(option) or '').strip(), caption=option, width=120)
                 
                 st.markdown("**Explanation:**")
                 st.write(question['explanation']['en'])
@@ -813,12 +919,16 @@ def view_questions_page():
                 # Edit question button
                 if st.button(f"✏️ Edit Question {i+1}", key=f"edit_{i}"):
                     # Copy question data to current question form
+                    v = question.get('verbose')
                     st.session_state.current_question = {
                         'question': question['question'].copy(),
                         'options': question['options'].copy(),
                         'answer': question['answer'],
-                        'explanation': question['explanation'].copy(),
-                        'verbose': question['verbose'].copy()
+                        'explanation': (question.get('explanation') or {}).copy() if isinstance(question.get('explanation'), dict) else {},
+                        'verbose': (v.copy() if isinstance(v, dict) else v) or {},
+                        'verbose_audio': dict(question.get('verbose_audio') or {}),
+                        'question_image_url': question.get('question_image_url'),
+                        'option_image_urls': dict(question.get('option_image_urls') or {}),
                     }
                     # Remove the question from the list
                     st.session_state.questions.pop(i)
@@ -865,6 +975,20 @@ def question_editor(question_data: Dict, question_id: Optional[str] = None, exam
             height=100,
             key=f"q_explanation_{question_id}"
         )
+
+        # Question image
+        q_img = (question_data.get('question_image_url') or '').strip()
+        if q_img:
+            st.image(q_img, width=200)
+        q_img_url_edit = st.text_input("Question image URL", value=q_img, key=f"q_img_url_edit_{question_id}")
+        opt_urls_existing = question_data.get('option_image_urls') or {}
+        option_image_urls_edit = {}
+        for opt in ['A', 'B', 'C', 'D']:
+            o_url = (opt_urls_existing.get(opt) or '').strip()
+            if o_url:
+                st.image(o_url, width=120)
+            option_image_urls_edit[opt] = st.text_input(f"Option {opt} image URL", value=o_url, key=f"opt_img_edit_{question_id}_{opt}")
+        opt_urls_edit = {k: (v.strip() or None) for k, v in option_image_urls_edit.items() if v and str(v).strip()}
         
         # Buttons
         col1, col2 = st.columns(2)
@@ -884,7 +1008,9 @@ def question_editor(question_data: Dict, question_id: Optional[str] = None, exam
                 'explanation': {'en': explanation_en, 'ha': question_data.get('explanation', {}).get('ha', ''),
                                'ig': question_data.get('explanation', {}).get('ig', ''),
                                'yo': question_data.get('explanation', {}).get('yo', '')},
-                'verbose': question_data.get('verbose', {})
+                'verbose': question_data.get('verbose', {}),
+                'question_image_url': q_img_url_edit.strip() or None,
+                'option_image_urls': opt_urls_edit or None,
             }
             
             errors = validate_question(updated_data)
@@ -1026,17 +1152,24 @@ def exam_detail_view(exam_id: str):
                         # Show question details
                         st.markdown("**Question:**")
                         st.write(question['question'].get('en', 'N/A'))
-                        
+                        q_img_url = (question.get('question_image_url') or '').strip()
+                        if q_img_url:
+                            st.image(q_img_url, width=200)
                         st.markdown("**Options:**")
                         col1, col2 = st.columns(2)
+                        opt_imgs = question.get('option_image_urls') or {}
                         with col1:
                             for opt in ['A', 'B']:
                                 marker = "✅" if opt == question['answer'] else "⚪"
                                 st.write(f"{marker} {opt}: {question['options'].get(opt, 'N/A')}")
+                                if (opt_imgs.get(opt) or '').strip():
+                                    st.image((opt_imgs.get(opt) or '').strip(), width=120)
                         with col2:
                             for opt in ['C', 'D']:
                                 marker = "✅" if opt == question['answer'] else "⚪"
                                 st.write(f"{marker} {opt}: {question['options'].get(opt, 'N/A')}")
+                                if (opt_imgs.get(opt) or '').strip():
+                                    st.image((opt_imgs.get(opt) or '').strip(), width=120)
                         
                         st.markdown("**Explanation:**")
                         st.write(question['explanation'].get('en', 'N/A'))
@@ -1053,7 +1186,9 @@ def exam_detail_view(exam_id: str):
             'options': {'A': '', 'B': '', 'C': '', 'D': ''},
             'answer': 'A',
             'explanation': {'en': '', 'ha': '', 'ig': '', 'yo': ''},
-            'verbose': {'en': '', 'ha': '', 'ig': '', 'yo': ''}
+            'verbose': {'en': '', 'ha': '', 'ig': '', 'yo': ''},
+            'question_image_url': None,
+            'option_image_urls': {},
         }
         
         def save_new_question(q_id, q_data):

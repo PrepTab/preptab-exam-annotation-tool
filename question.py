@@ -15,6 +15,8 @@ class Question(Base):
     explanation = Column(JSONB, nullable=True) # {"en": "...", ...}
     verbose = Column(JSONB, nullable=True) # {"en": "...", "ha": "...", ...}
     verbose_audio = Column(JSONB, nullable=True) # {"en": <BLOB>, "ha": <BLOB>, ...}
+    question_image_url = Column(String, nullable=True)  # optional diagram URL
+    option_image_urls = Column(JSONB, nullable=True)   # e.g. {"A": "url", "B": "url", ...}
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     def __repr__(self):
